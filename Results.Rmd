@@ -1,0 +1,1581 @@
+
+```{r 制作基线图表}
+
+library(tableone)
+
+用于建模数据 <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data<-用于建模数据
+
+str(data)
+
+# 定义要排除的列名
+exclude_vars <- c("Participant_ID", "Group", "CXCL11.C.X.C.motif.chemokine.11", 
+                  "FGF5.Fibroblast.growth.factor.5", "AF", "Date_of_consenting", 
+                  "Follow_up_duration", "Follow_up_duration_years", 
+                  "Participant ID", "Date of attending assessment centre | Instance 0", 
+                  "UK Biobank assessment centre | Instance 0")
+
+# 选择不在排除列表中的列名
+myVars <- names(data)[!names(data) %in% exclude_vars]
+
+
+# 初始化一个空向量用于存储分类变量
+catVars <- c()
+
+# 遍历所有变量，并检查是否为分类变量
+for (var in myVars) {
+  if (is.factor(data[[var]])) {
+    catVars <- c(catVars, var)
+  }
+}
+
+# 初始化一个空向量用于存储不服从正态分布的变量
+nonvar <- c()
+
+library(nortest)
+# 遍历所有变量，并进行正态性检验
+for (var in myVars) {
+  if (is.numeric(data[[var]])) {
+    ad_result <- ad.test(data[[var]])
+    if (ad_result$p.value <= 0.05) {
+      nonvar <- c(nonvar, var)
+    }
+  }
+}
+print(nonvar)
+
+# 初始化一个空向量用于存储需要使用 Fisher 精确检验的变量
+exactvars <- c()
+
+# 遍历所有变量，并进行 Fisher 精确检验或卡方检验判断
+for (var in myVars) {
+  if (is.factor(data[[var]])) {
+    table <- table(data[[var]])
+    n <- sum(table)
+    
+    # 检查是否满足条件1
+    if (n >= 40 && sum(table < 5) >= 2 && any(table < 5)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+    # 检查是否满足条件2
+    if (n < 40 || any(table < 1)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+  }
+}
+
+table <- CreateTableOne(vars = myVars, #条件1
+                        factorVars = catVars,#条件2
+                        strata = "AF", #条件4
+                        data = data, #原始数据
+                        addOverall = TRUE) #条件6加入overall
+
+
+table1<- print(table, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table1, file = "~/房颤与炎症性疾病/Data/文章表格/table1.csv")
+
+```
+
+
+```{r 表格：59个蛋白的HR值}
+# 设置数据目录路径
+data_dir <- "/home/wangxihe/房颤与炎症性疾病/Data/插补后用于数据分析的59个蛋白队列"
+
+# 获取目录中的所有.RData文件，排除FGF5_CXCL11_cox_model_full.RData
+rdata_files <- list.files(data_dir, pattern = "\\.RData$", full.names = TRUE)
+rdata_files <- rdata_files[!grepl("FGF5_CXCL11_cox_model_full\\.RData$", rdata_files)]
+
+# 初始化一个空的数据框来存储结果
+results <- data.frame(Protein = character(), HR = numeric(), CI_Lower = numeric(), CI_Upper = numeric(), stringsAsFactors = FALSE)
+
+# 遍历每个.RData文件
+for (file in rdata_files) {
+  # 加载RData文件
+  load(file)
+  
+  # 获取文件名中的蛋白简称
+  protein_name <- sub("_cox_model_full\\.RData$", "", basename(file))
+  
+  # 假设每个RData文件中包含一个与文件名相对应的Cox模型对象
+  model_name <- paste0(protein_name, "_cox_model_full")
+  
+  # 确保模型对象存在
+  if (exists(model_name)) {
+    model <- get(model_name)
+    
+    # 确保对象是Cox模型
+    if (inherits(model, "coxph")) {
+      summary_model <- summary(model)
+      coefficients <- summary_model$coefficients
+      
+      # 提取变量名中第一个.之前的蛋白名称
+      var_protein_names <- sub("\\..*", "", rownames(coefficients))
+      
+      # 找到与文件名中的蛋白简称匹配的变量
+      matching_vars <- rownames(coefficients)[var_protein_names == protein_name]
+      
+      if (length(matching_vars) > 0) {
+        coef_info <- coefficients[matching_vars, , drop = FALSE]
+        
+        # 计算HR值和95%可信区间
+        hr <- exp(coef_info[, "coef"])
+        ci_lower <- exp(coef_info[, "coef"] - 1.96 * coef_info[, "se(coef)"])
+        ci_upper <- exp(coef_info[, "coef"] + 1.96 * coef_info[, "se(coef)"])
+        
+        # 将结果添加到数据框
+        results <- rbind(results, data.frame(Protein = protein_name, HR = hr, CI_Lower = ci_lower, CI_Upper = ci_upper))
+      }
+    }
+  }
+}
+
+saveRDS(results, file = "~/房颤与炎症性疾病/Data/59个蛋白HR值.RDS")
+write.csv(results, file = "~/房颤与炎症性疾病/Data/文章表格/59个蛋白HR值.csv")
+```
+
+
+```{r 图：59个蛋白的HR值森林图+孟德尔森林图}
+library(ggplot2)
+library(grid)
+
+#--------------------------------------- 首先绘制HR图 -------------------------------------
+
+data_hr <- readRDS("~/房颤与炎症性疾病/Data/59个蛋白HR值.RDS")
+
+# 准备标签数据框，保留两位小数
+format_num <- function(x) sprintf("%.2f", x)
+data_hr$Label <- paste0(format_num(data_hr$HR), "  [", format_num(data_hr$CI_Lower), ", ", format_num(data_hr$CI_Upper), "]")
+
+hr_plot <- ggplot(data_hr, aes(x = reorder(Protein, HR), y = HR, color = HR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +  # 翻转坐标轴，使得Protein在y轴
+  labs(title = "HR with 95% CI for Different Proteins",
+       x = "Protein",
+       y = "Hazard Ratio (HR)") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),   # 去除背景线
+    panel.grid.minor = element_blank(),   # 去除背景线
+    axis.line.x = element_line(color = "black"),  # 保留x轴
+    axis.line.y = element_blank(),  # 去除y轴
+    axis.ticks.y = element_blank(),  # 去除y轴刻度
+    axis.ticks.x = element_line(color = "black"),  # x轴刻度黑色
+    text = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.y = element_text(family = "Arial", face = "bold.italic", color = "black"),
+    plot.title = element_text(family = "Arial", face = "bold", color = "black"),
+    plot.margin = unit(c(1, 10, 1, 1), "lines")  # 调整右边距以适应标签
+  ) +
+  # 添加HR=1的黑线
+  geom_hline(yintercept = 1, linetype = "solid", color = "black") +
+  # 当HR > 1时，箭头位于误差线的上端
+  geom_segment(data = subset(data_hr, HR > 1),
+               aes(x = reorder(Protein, HR), xend = reorder(Protein, HR), 
+                   y = CI_Upper, yend = CI_Upper + 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 当HR < 1时，箭头位于误差线的下端
+  geom_segment(data = subset(data_hr, HR < 1),
+               aes(x = reorder(Protein, HR), xend = reorder(Protein, HR), 
+                   y = CI_Lower, yend = CI_Lower - 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 添加标签，统一放到HR=1.9的位置并左对齐
+  geom_text(aes(label = Label, y = HR), 
+            y = 1.9, 
+            hjust = 0, 
+            size = 3, 
+            color = "black",
+            fontface = "bold") +
+  ylim(NA, 2.2)
+
+#--------------------------------------- 孟德尔验证队列森林图 ---------------------------------
+
+data_mr_validation <- readRDS("~/房颤与炎症性疾病/Data/GCST006414验证队列循环蛋白最终MR结果.RDS")
+
+# 将data_mr_validation$exposure中的IL8变为CXCL8
+data_mr_validation <- data_mr_validation %>%
+  mutate(exposure = recode(exposure, "IL8" = "CXCL8"))
+
+# 创建函数，根据优先级选择行
+select_preferred_method <- function(df) {
+  if ("Inverse variance weighted" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted")
+  } else if ("Inverse variance weighted (multiplicative random effects)" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted (multiplicative random effects)")
+  } else if ("Wald ratio" %in% df$method) {
+    df %>% filter(method == "Wald ratio")
+  } else {
+    print(paste("No preferred method found for protein:", unique(df$exposure)))
+    df[1, ] # 如果没有优先级方法，选择第一行作为默认
+  }
+}
+
+# 按exposure分组并应用选择函数
+data_mr_validation <- data_mr_validation %>%
+  group_by(exposure) %>%
+  group_modify(~ select_preferred_method(.x))
+
+# 获取第一张图中的蛋白顺序
+protein_order <- data_hr$Protein[order(data_hr$HR)]
+
+# 确保所有exposure都在蛋白顺序中
+missing_proteins <- setdiff(unique(data_mr_validation$exposure), protein_order)
+if (length(missing_proteins) > 0) {
+  warning("The following proteins are missing in the first plot order: ", paste(missing_proteins, collapse = ", "))
+}
+
+data_mr_validation$exposure <- factor(data_mr_validation$exposure, levels = protein_order)
+
+# 准备标签数据框，保留两位小数
+format_num <- function(x) sprintf("%.2f", x)
+data_mr_validation$Label <- paste0(format_num(data_mr_validation$or), 
+                                   "  [", format_num(data_mr_validation$or_lci95),
+                                   ", ", format_num(data_mr_validation$or_uci95), "]")
+
+max(data_mr_validation$or_uci95)
+
+# 然后在OR图中应用相同的颜色分度，并在0.6-1.6之间渐变
+mr_validation_plot <- ggplot(data_mr_validation, aes(x = exposure, y = or, color = or)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = or_lci95, ymax = or_uci95), width = 0) +
+  scale_color_gradientn(colors = c("blue", "blue", "red"), 
+                        values = scales::rescale(c(0.4, 1, 1.1), from = c(min(data_mr_validation$or), max(data_mr_validation$or)))) +
+  coord_flip() +  # 翻转坐标轴，使得exposure在y轴
+  theme_minimal() +
+  labs(title = "OR with 95% CI for Different Proteins",
+       x = "Odds Ratio (OR)",
+       y = "Protein") +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),   # 去除背景线
+    panel.grid.minor = element_blank(),   # 去除背景线
+    axis.line.x = element_line(color = "black"),  # 保留x轴
+    axis.line.y = element_blank(),  # 去除y轴
+    axis.ticks.y = element_blank(),  # 去除y轴刻度
+    axis.ticks.x = element_line(color = "black"),  # x轴刻度黑色
+    text = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.y = element_text(family = "Arial", face = "bold.italic", color = "black"),
+    plot.title = element_text(family = "Arial", face = "bold", color = "black"),
+    plot.margin = unit(c(1, 10, 1, 1), "lines")  # 调整右边距以适应标签
+  ) +
+  # 添加HR=1的黑线
+  geom_hline(yintercept = 1, linetype = "solid", color = "black") +
+  # 当or > 1时，箭头位于误差线的上端
+  geom_segment(data = subset(data_mr_validation, or > 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_uci95, yend = or_uci95 + 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 当or < 1时，箭头位于误差线的下端
+  geom_segment(data = subset(data_mr_validation, or < 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_lci95, yend = or_lci95 - 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm")))+
+  # 添加标签，统一放到HR=1.9的位置并左对齐
+  geom_text(aes(label = Label, y = or), 
+            y = 1.65, 
+            hjust = 0, 
+            size = 3, 
+            color = "black",
+            fontface = "bold") +
+  ylim(NA, 2.2)
+
+#------------------------------------- 孟德尔发现队列森林图 ----------------------------------
+
+data_mr_discovery <- readRDS("~/房颤与炎症性疾病/Data/芬兰发现队列循环蛋白最终MR结果.RDS")
+
+# 如果 or 存在 NA，将 or、or_lci95 和 or_uci95 赋予值 1
+data_mr_discovery$or[is.na(data_mr_discovery$or)] <- 1
+data_mr_discovery$or_lci95[is.na(data_mr_discovery$or_lci95)] <- 1
+data_mr_discovery$or_uci95[is.na(data_mr_discovery$or_uci95)] <- 1
+
+# 将data_mr_discovery$exposure中的IL8变为CXCL8
+data_mr_discovery <- data_mr_discovery %>%
+  mutate(exposure = recode(exposure, "IL8" = "CXCL8"))
+
+# 创建函数，根据优先级选择行
+select_preferred_method <- function(df) {
+  if ("Inverse variance weighted" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted")
+  } else if ("Inverse variance weighted (multiplicative random effects)" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted (multiplicative random effects)")
+  } else if ("Wald ratio" %in% df$method) {
+    df %>% filter(method == "Wald ratio")
+  } else {
+    print(paste("No preferred method found for protein:", unique(df$exposure)))
+    df[1, ] # 如果没有优先级方法，选择第一行作为默认
+  }
+}
+
+# 按exposure分组并应用选择函数
+data_mr_discovery <- data_mr_discovery %>%
+  group_by(exposure) %>%
+  group_modify(~ select_preferred_method(.x))
+
+# 获取第一张图中的蛋白顺序
+protein_order <- data_hr$Protein[order(data_hr$HR)]
+
+# 确保所有exposure都在蛋白顺序中
+missing_proteins <- setdiff(unique(data_mr_discovery$exposure), protein_order)
+if (length(missing_proteins) > 0) {
+  warning("The following proteins are missing in the first plot order: ", paste(missing_proteins, collapse = ", "))
+}
+
+data_mr_discovery$exposure <- factor(data_mr_discovery$exposure, levels = protein_order)
+
+# 准备标签数据框，保留两位小数
+format_num <- function(x) sprintf("%.2f", x)
+data_mr_discovery$Label <- paste0(format_num(data_mr_discovery$or), 
+                                  "  [", format_num(data_mr_discovery$or_lci95),
+                                  ", ", format_num(data_mr_discovery$or_uci95), "]")
+
+max(data_mr_discovery$or_uci95)
+
+# 然后在OR图中应用相同的颜色分度，并在0.6-1.6之间渐变
+mr_discovery_plot <- ggplot(data_mr_discovery, aes(x = exposure, y = or, color = or)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = or_lci95, ymax = or_uci95), width = 0) +
+  scale_color_gradientn(colors = c("blue", "blue", "red"), 
+                        values = scales::rescale(c(0.6, 1, 1.4), from = c(min(data_mr_discovery$or), max(data_mr_discovery$or)))) +
+  coord_flip() +  # 翻转坐标轴，使得exposure在y轴
+  theme_minimal() +
+  labs(title = "OR with 95% CI for Different Proteins",
+       x = "Odds Ratio (OR)",
+       y = "Protein") +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),   # 去除背景线
+    panel.grid.minor = element_blank(),   # 去除背景线
+    axis.line.x = element_line(color = "black"),  # 保留x轴
+    axis.line.y = element_blank(),  # 去除y轴
+    axis.ticks.y = element_blank(),  # 去除y轴刻度
+    axis.ticks.x = element_line(color = "black"),  # x轴刻度黑色
+    text = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.y = element_text(family = "Arial", face = "bold.italic", color = "black"),
+    plot.title = element_text(family = "Arial", face = "bold", color = "black"),
+    plot.margin = unit(c(1, 10, 1, 1), "lines")  # 调整右边距以适应标签
+  ) +
+  # 添加HR=1的黑线
+  geom_hline(yintercept = 1, linetype = "solid", color = "black") +
+  # 当or > 1时，箭头位于误差线的上端
+  geom_segment(data = subset(data_mr_discovery, or > 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_uci95, yend = or_uci95 + 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 当or < 1时，箭头位于误差线的下端
+  geom_segment(data = subset(data_mr_discovery, or < 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_lci95, yend = or_lci95 - 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm")))+
+  # 添加标签，统一放到HR=1.9的位置并左对齐
+  geom_text(aes(label = Label, y = or), 
+            y = 2.00, 
+            hjust = 0, 
+            size = 3, 
+            color = "black",
+            fontface = "bold") +
+  ylim(NA, 2.5)
+
+print(hr_plot)
+print(mr_validation_plot)
+print(mr_discovery_plot)
+```
+
+
+```{r 图：59个蛋白单独孟德尔森林图}
+library(ggplot2)
+library(grid)
+
+#------------------------------------- 孟德尔发现队列森林图 ----------------------------------
+
+data_mr_discovery <- readRDS("~/房颤与炎症性疾病/Data/芬兰发现队列循环蛋白最终MR结果.RDS")
+
+# 如果 or 存在 NA，将 or、or_lci95 和 or_uci95 赋予值 1
+data_mr_discovery$or[is.na(data_mr_discovery$or)] <- 1
+data_mr_discovery$or_lci95[is.na(data_mr_discovery$or_lci95)] <- 1
+data_mr_discovery$or_uci95[is.na(data_mr_discovery$or_uci95)] <- 1
+
+# 将data_mr_discovery$exposure中的IL8变为CXCL8
+data_mr_discovery <- data_mr_discovery %>%
+  mutate(exposure = recode(exposure, "IL8" = "CXCL8"))
+
+# 创建函数，根据优先级选择行
+select_preferred_method <- function(df) {
+  if ("Inverse variance weighted" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted")
+  } else if ("Inverse variance weighted (multiplicative random effects)" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted (multiplicative random effects)")
+  } else if ("Wald ratio" %in% df$method) {
+    df %>% filter(method == "Wald ratio")
+  } else {
+    print(paste("No preferred method found for protein:", unique(df$exposure)))
+    df[1, ] # 如果没有优先级方法，选择第一行作为默认
+  }
+}
+
+# 按exposure分组并应用选择函数
+data_mr_discovery <- data_mr_discovery %>%
+  group_by(exposure) %>%
+  group_modify(~ select_preferred_method(.x))
+
+
+# 准备标签数据框，保留两位小数
+format_num <- function(x) sprintf("%.2f", x)
+data_mr_discovery$Label <- paste0(format_num(data_mr_discovery$or), 
+                                  "  [", format_num(data_mr_discovery$or_lci95),
+                                  ", ", format_num(data_mr_discovery$or_uci95), "]")
+
+max(data_mr_discovery$or_uci95)
+
+# 然后在OR图中应用相同的颜色分度，并在0.6-1.6之间渐变
+mr_discovery_plot <- ggplot(data_mr_discovery, aes(x = reorder(exposure, or), y = or, color = or)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = or_lci95, ymax = or_uci95), width = 0) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +  # 翻转坐标轴，使得exposure在y轴
+  theme_minimal() +
+  labs(title = "OR with 95% CI for Different Proteins",
+       x = "Odds Ratio (OR)",
+       y = "Protein") +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),   # 去除背景线
+    panel.grid.minor = element_blank(),   # 去除背景线
+    axis.line.x = element_line(color = "black"),  # 保留x轴
+    axis.line.y = element_blank(),  # 去除y轴
+    axis.ticks.y = element_blank(),  # 去除y轴刻度
+    axis.ticks.x = element_line(color = "black"),  # x轴刻度黑色
+    text = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.y = element_text(family = "Arial", face = "bold.italic", color = "black"),
+    plot.title = element_text(family = "Arial", face = "bold", color = "black"),
+    plot.margin = unit(c(1, 10, 1, 1), "lines")  # 调整右边距以适应标签
+  ) +
+  # 添加HR=1的黑线
+  geom_hline(yintercept = 1, linetype = "solid", color = "black") +
+  # 当or > 1时，箭头位于误差线的上端
+  geom_segment(data = subset(data_mr_discovery, or > 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_uci95, yend = or_uci95 + 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 当or < 1时，箭头位于误差线的下端
+  geom_segment(data = subset(data_mr_discovery, or < 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_lci95, yend = or_lci95 - 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm")))+
+  # 添加标签，统一放到HR=1.9的位置并左对齐
+  geom_text(aes(label = Label, y = or), 
+            y = 2.00, 
+            hjust = 0, 
+            size = 3, 
+            color = "black",
+            fontface = "bold") +
+  ylim(NA, 2.5)
+
+#--------------------------------------- 孟德尔验证队列森林图 ---------------------------------
+
+data_mr_validation <- readRDS("~/房颤与炎症性疾病/Data/GCST006414验证队列循环蛋白最终MR结果.RDS")
+
+# 将data_mr_validation$exposure中的IL8变为CXCL8
+data_mr_validation <- data_mr_validation %>%
+  mutate(exposure = recode(exposure, "IL8" = "CXCL8"))
+
+# 创建函数，根据优先级选择行
+select_preferred_method <- function(df) {
+  if ("Inverse variance weighted" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted")
+  } else if ("Inverse variance weighted (multiplicative random effects)" %in% df$method) {
+    df %>% filter(method == "Inverse variance weighted (multiplicative random effects)")
+  } else if ("Wald ratio" %in% df$method) {
+    df %>% filter(method == "Wald ratio")
+  } else {
+    print(paste("No preferred method found for protein:", unique(df$exposure)))
+    df[1, ] # 如果没有优先级方法，选择第一行作为默认
+  }
+}
+
+# 按exposure分组并应用选择函数
+data_mr_validation <- data_mr_validation %>%
+  group_by(exposure) %>%
+  group_modify(~ select_preferred_method(.x))
+
+# 获取第一张图中的蛋白顺序
+protein_order <- data_mr_discovery$exposure[order(data_mr_discovery$or)]
+
+# 确保所有exposure都在蛋白顺序中
+missing_proteins <- setdiff(unique(data_mr_validation$exposure), protein_order)
+if (length(missing_proteins) > 0) {
+  warning("The following proteins are missing in the first plot order: ", paste(missing_proteins, collapse = ", "))
+}
+
+data_mr_validation$exposure <- factor(data_mr_validation$exposure, levels = protein_order)
+
+# 准备标签数据框，保留两位小数
+format_num <- function(x) sprintf("%.2f", x)
+data_mr_validation$Label <- paste0(format_num(data_mr_validation$or), 
+                                   "  [", format_num(data_mr_validation$or_lci95),
+                                   ", ", format_num(data_mr_validation$or_uci95), "]")
+
+max(data_mr_validation$or_uci95)
+
+# 然后在OR图中应用相同的颜色分度，并在0.6-1.6之间渐变
+mr_validation_plot <- ggplot(data_mr_validation, aes(x = exposure, y = or, color = or)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = or_lci95, ymax = or_uci95), width = 0) +
+  scale_color_gradientn(colors = c("blue", "blue", "red"), 
+                        values = scales::rescale(c(0.4, 1, 1.1), from = c(min(data_mr_validation$or), max(data_mr_validation$or)))) +
+  coord_flip() +  # 翻转坐标轴，使得exposure在y轴
+  theme_minimal() +
+  labs(title = "OR with 95% CI for Different Proteins",
+       x = "Odds Ratio (OR)",
+       y = "Protein") +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),   # 去除背景线
+    panel.grid.minor = element_blank(),   # 去除背景线
+    axis.line.x = element_line(color = "black"),  # 保留x轴
+    axis.line.y = element_blank(),  # 去除y轴
+    axis.ticks.y = element_blank(),  # 去除y轴刻度
+    axis.ticks.x = element_line(color = "black"),  # x轴刻度黑色
+    text = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Arial", face = "bold", color = "black"),
+    axis.text.y = element_text(family = "Arial", face = "bold.italic", color = "black"),
+    plot.title = element_text(family = "Arial", face = "bold", color = "black"),
+    plot.margin = unit(c(1, 10, 1, 1), "lines")  # 调整右边距以适应标签
+  ) +
+  # 添加HR=1的黑线
+  geom_hline(yintercept = 1, linetype = "solid", color = "black") +
+  # 当or > 1时，箭头位于误差线的上端
+  geom_segment(data = subset(data_mr_validation, or > 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_uci95, yend = or_uci95 + 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+  # 当or < 1时，箭头位于误差线的下端
+  geom_segment(data = subset(data_mr_validation, or < 1),
+               aes(x = exposure, xend = exposure, 
+                   y = or_lci95, yend = or_lci95 - 0.01),
+               arrow = arrow(type = "closed", length = unit(0.1, "cm")))+
+  # 添加标签，统一放到HR=1.9的位置并左对齐
+  geom_text(aes(label = Label, y = or), 
+            y = 1.65, 
+            hjust = 0, 
+            size = 3, 
+            color = "black",
+            fontface = "bold") +
+  ylim(NA, 2.2)
+
+print(mr_validation_plot)
+print(mr_discovery_plot)
+```
+
+
+```{r 有意义蛋白孟德尔随机化数据展示}
+芬兰发现队列循环蛋白最终MR结果 <- readRDS("~/房颤与炎症性疾病/Data/芬兰发现队列循环蛋白最终MR结果.RDS")
+
+MR_results<-芬兰发现队列循环蛋白最终MR结果
+
+str(MR_results)
+
+output_dir <- "~/房颤与炎症性疾病/Data/文章表格"
+# 将列表列转换为字符列
+MR_results$exposure_SNP <- sapply(MR_results$exposure_SNP, toString)
+MR_results$outcome_SNP <- sapply(MR_results$outcome_SNP, toString)
+
+# 将数据保存为CSV文件到目标文件夹中
+write.csv(MR_results, file = file.path(output_dir, "芬兰发现队列循环蛋白最终MR结果.csv"), row.names = FALSE)
+
+#------------------------------------发现队列----------------------------------------------
+AF_duplicate_total <- readRDS("~/房颤与炎症性疾病/Data/AF_duplicate.RDS")
+
+AF_dat <- AF_duplicate_total[AF_duplicate_total$SNP %in% CXCL11_exp_dat$SNP, ]
+
+length(AF_dat$SNP) # 5
+
+# ④ 计算R2和F值
+
+calculate_r2_F <- function(data, N, K) {
+  data$r2 <- (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure)) /
+    (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure) +
+       2 * N * data$eaf.exposure * (1 - data$eaf.exposure) * data$se.exposure^2)
+  
+  data$r2_sum <- sum(data$r2)
+  
+  data$F <- data$r2 * (N - 2) / (1 - data$r2)
+  
+  data$F_mean <- mean(data$F)
+  
+  return(data)
+}
+
+Number_sample=14736
+N<-Number_sample
+k<-length(CXCL11_exp_dat$SNP)
+
+CXCL11_exp_dat <- calculate_r2_F(CXCL11_exp_dat, N, k)
+
+CXCL11_exp_dat
+
+#-------------------------------harmonise-------------------------------
+CXCL11_to_AF_harmonise_data <- harmonise_data(exposure_dat = CXCL11_exp_dat, outcome_dat = AF_dat)
+
+#----------Sensitivity analyses
+#-------------------------------Heterogeneity statistics-----------------
+mr_heterogeneity(CXCL11_to_AF_harmonise_data)
+mr_heterogeneity(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+
+#---------Horizontal pleiotropy------------------
+mr_pleiotropy_test(CXCL11_to_AF_harmonise_data)
+
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data)
+CXCL11_to_AF 
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+CXCL11_to_AF 
+
+
+#------------------------------------验证队列----------------------------------------------
+
+GCST006414验证队列循环蛋白最终MR结果_0.05 <- readRDS("~/房颤与炎症性疾病/Data/GCST006414验证队列循环蛋白最终MR结果_0.05.RDS")
+MR_results<-GCST006414验证队列循环蛋白最终MR结果_0.05
+
+str(MR_results)
+
+# 将列表列转换为字符列
+MR_results$exposure_SNP <- sapply(MR_results$exposure_SNP, toString)
+MR_results$outcome_SNP <- sapply(MR_results$outcome_SNP, toString)
+
+# 将数据保存为CSV文件到目标文件夹中
+write.csv(MR_results, file = file.path(output_dir, "GCST006414验证队列循环蛋白最终MR结果_0.05.csv"), row.names = FALSE)
+
+
+AF_dat_total <- readRDS("~/房颤与炎症性疾病/Data/AF_dat.RDS")
+
+AF_dat <- AF_dat_total[AF_dat_total$SNP %in% CXCL11_exp_dat$SNP, ]
+
+length(AF_dat$SNP) # 5
+
+# ④ 计算R2和F值
+
+calculate_r2_F <- function(data, N, K) {
+  data$r2 <- (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure)) /
+    (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure) +
+       2 * N * data$eaf.exposure * (1 - data$eaf.exposure) * data$se.exposure^2)
+  
+  data$r2_sum <- sum(data$r2)
+  
+  data$F <- data$r2 * (N - 2) / (1 - data$r2)
+  
+  data$F_mean <- mean(data$F)
+  
+  return(data)
+}
+
+Number_sample=14736
+N<-Number_sample
+k<-length(CXCL11_exp_dat$SNP)
+
+CXCL11_exp_dat <- calculate_r2_F(CXCL11_exp_dat, N, k)
+
+CXCL11_exp_dat
+
+#-------------------------------harmonise-------------------------------
+CXCL11_to_AF_harmonise_data <- harmonise_data(exposure_dat = CXCL11_exp_dat, outcome_dat = AF_dat)
+
+#----------Sensitivity analyses
+#-------------------------------Heterogeneity statistics-----------------
+mr_heterogeneity(CXCL11_to_AF_harmonise_data)
+mr_heterogeneity(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+
+#---------Horizontal pleiotropy------------------
+mr_pleiotropy_test(CXCL11_to_AF_harmonise_data)
+
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data)
+CXCL11_to_AF 
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+CXCL11_to_AF 
+
+
+
+FGF5_exp_dat <- readRDS("~/房颤与炎症性疾病/Data/59个cis-pQTLs/FGF5_exp_dat.RDS")
+#------------------------------------发现队列----------------------------------------------
+AF_duplicate_total <- readRDS("~/房颤与炎症性疾病/Data/AF_duplicate.RDS")
+
+AF_dat <- AF_duplicate_total[AF_duplicate_total$SNP %in% FGF5_exp_dat$SNP, ]
+
+length(AF_dat$SNP) # 4
+
+# ④ 计算R2和F值
+
+calculate_r2_F <- function(data, N, K) {
+  data$r2 <- (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure)) /
+    (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure) +
+       2 * N * data$eaf.exposure * (1 - data$eaf.exposure) * data$se.exposure^2)
+  
+  data$r2_sum <- sum(data$r2)
+  
+  data$F <- data$r2 * (N - 2) / (1 - data$r2)
+  
+  data$F_mean <- mean(data$F)
+  
+  return(data)
+}
+
+Number_sample=14736
+N<-Number_sample
+k<-length(FGF5_exp_dat$SNP)
+
+FGF5_exp_dat <- calculate_r2_F(FGF5_exp_dat, N, k)
+
+FGF5_exp_dat
+
+#-------------------------------harmonise-------------------------------
+CXCL11_to_AF_harmonise_data <- harmonise_data(exposure_dat = FGF5_exp_dat, outcome_dat = AF_dat)
+
+#----------Sensitivity analyses
+#-------------------------------Heterogeneity statistics-----------------
+mr_heterogeneity(CXCL11_to_AF_harmonise_data)
+mr_heterogeneity(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+
+#---------Horizontal pleiotropy------------------
+mr_pleiotropy_test(CXCL11_to_AF_harmonise_data)
+
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data)
+CXCL11_to_AF 
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+CXCL11_to_AF 
+
+
+#------------------------------------验证队列----------------------------------------------
+
+GCST006414验证队列循环蛋白最终MR结果_0.05 <- readRDS("~/房颤与炎症性疾病/Data/GCST006414验证队列循环蛋白最终MR结果_0.05.RDS")
+MR_results<-GCST006414验证队列循环蛋白最终MR结果_0.05
+
+str(MR_results)
+
+# 将列表列转换为字符列
+MR_results$exposure_SNP <- sapply(MR_results$exposure_SNP, toString)
+MR_results$outcome_SNP <- sapply(MR_results$outcome_SNP, toString)
+
+# 将数据保存为CSV文件到目标文件夹中
+write.csv(MR_results, file = file.path(output_dir, "GCST006414验证队列循环蛋白最终MR结果_0.05.csv"), row.names = FALSE)
+
+
+AF_dat_total <- readRDS("~/房颤与炎症性疾病/Data/AF_dat.RDS")
+
+AF_dat <- AF_dat_total[AF_dat_total$SNP %in% FGF5_exp_dat$SNP, ]
+
+length(AF_dat$SNP) # 4
+
+# ④ 计算R2和F值
+
+calculate_r2_F <- function(data, N, K) {
+  data$r2 <- (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure)) /
+    (2 * (data$beta.exposure^2) * data$eaf.exposure * (1 - data$eaf.exposure) +
+       2 * N * data$eaf.exposure * (1 - data$eaf.exposure) * data$se.exposure^2)
+  
+  data$r2_sum <- sum(data$r2)
+  
+  data$F <- data$r2 * (N - 2) / (1 - data$r2)
+  
+  data$F_mean <- mean(data$F)
+  
+  return(data)
+}
+
+Number_sample=14736
+N<-Number_sample
+k<-length(FGF5_exp_dat$SNP)
+
+FGF5_exp_dat <- calculate_r2_F(FGF5_exp_dat, N, k)
+
+FGF5_exp_dat
+
+#-------------------------------harmonise-------------------------------
+CXCL11_to_AF_harmonise_data <- harmonise_data(exposure_dat = FGF5_exp_dat, outcome_dat = AF_dat)
+
+#----------Sensitivity analyses
+#-------------------------------Heterogeneity statistics-----------------
+mr_heterogeneity(CXCL11_to_AF_harmonise_data)
+mr_heterogeneity(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+
+#---------Horizontal pleiotropy------------------
+mr_pleiotropy_test(CXCL11_to_AF_harmonise_data)
+
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data)
+CXCL11_to_AF 
+
+CXCL11_to_AF <- mr(CXCL11_to_AF_harmonise_data,method_list = c('mr_ivw_mre'))
+CXCL11_to_AF 
+```
+
+
+```{r Cox建模队列多因素表格}
+# 加载必要的包
+library(survival)
+library(survminer)
+library(pROC)
+
+用于建模数据 <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+chort<-用于建模数据
+
+# 筛选显著变量
+pre_var <- c("Age.at.recruitment", "Gender_Male1_Female0", "CXCL11.C.X.C.motif.chemokine.11", 
+             "FGF5.Fibroblast.growth.factor.5", "Ethnic_white", "Education_level_numeric", 
+             "Socioeconomic_deprivation", "Current_smoking",  "Alcohol_status","Severe_pollution", 
+             "physical_inactivity", "No_coffee_intake", "Loneliness", "Broad_depression", 
+             "hypertension", "Low_LDL_C", "Low_Triglycerides", "Diabetes", "Overweight", 
+             "Elevated_CRP", "Clinical_comorbidities")
+
+# 构建公式
+formula <- as.formula(paste("Surv(Follow_up_duration, AF) ~", paste(pre_var, collapse = " + ")))
+
+chort$AF <- as.numeric(as.factor(chort$AF)) -1
+# 在训练集上拟合Cox回归模型
+Cox_model <- coxph(formula, data = chort)
+
+summary(Cox_model)
+
+# 读取必要的包
+library(survival)
+library(openxlsx)
+
+# 获取Cox模型摘要
+cox_summary <- summary(Cox_model)
+
+# 提取相关信息
+variables <- rownames(cox_summary$coefficients)
+hr <- round(exp(cox_summary$coefficients[, "coef"]), 2)
+p_values_raw <- round(cox_summary$coefficients[, "Pr(>|z|)"], 3)
+ci_lower <- round(cox_summary$conf.int[, "lower .95"], 2)
+ci_upper <- round(cox_summary$conf.int[, "upper .95"], 2)
+
+# 格式化P值，将小于0.001的P值设置为<0.001
+p_values <- ifelse(p_values_raw < 0.001, "<0.001", as.character(p_values_raw))
+
+# 创建数据框存储结果
+results_df <- data.frame(
+  Variable = variables,
+  HR = hr,
+  CI_Lower = ci_lower,
+  CI_Upper = ci_upper,
+  P_Value = p_values,
+  stringsAsFactors = FALSE
+)
+
+# 打印数据框
+print(results_df)
+
+# 保存为Excel文件
+output_dir <- "~/房颤与炎症性疾病/Data/文章表格"
+
+output_file <- file.path(output_dir, "Cox_model_建模队列.xlsx")
+write.xlsx(results_df, output_file, rowNames = FALSE)
+```
+
+
+
+```{r 限制性立方样条}
+# 安装并加载必要的包
+#install.packages("rms")
+#install.packages("survival")
+library(rms)
+library(survival)
+
+用于建模数据 <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data<-用于建模数据
+str(data)
+data$AF <- as.numeric(as.factor(data$AF)) -1
+
+dd <- datadist(data)
+options(datadist = 'dd')
+
+# 创建限制性立方样条
+rcs_CXCL11 <- rcs(data$CXCL11.C.X.C.motif.chemokine.11, 4)
+rcs_FGF5 <- rcs(data$FGF5.Fibroblast.growth.factor.5, 4)
+
+# 拟合Cox模型，包含限制性立方样条项
+cox_model <- cph(Surv(Follow_up_duration, AF) ~ Age.at.recruitment + Gender_Male1_Female0 + 
+                   rcs(CXCL11.C.X.C.motif.chemokine.11, 4) + rcs(FGF5.Fibroblast.growth.factor.5, 4) + 
+                   Ethnic_white + Education_level_numeric + Socioeconomic_deprivation + 
+                   Current_smoking + Alcohol_status+Severe_pollution + physical_inactivity + No_coffee_intake + 
+                   Loneliness + Broad_depression + hypertension + Low_LDL_C + Low_Triglycerides + 
+                   Diabetes + Overweight + Elevated_CRP + Clinical_comorbidities, data = data, 
+                 x = TRUE, y = TRUE)
+
+options(datadist = NULL)
+
+# 查看模型摘要
+summary(cox_model)
+anova(cox_model)
+
+# 可视化 CXCL11.C.X.C.motif.chemokine.11 的非线性效应
+plot(Predict(cox_model, CXCL11.C.X.C.motif.chemokine.11))
+
+# 可视化 FGF5.Fibroblast.growth.factor.5 的非线性效应
+plot(Predict(cox_model, FGF5.Fibroblast.growth.factor.5))
+
+HR_CXCL11<-Predict(cox_model, CXCL11.C.X.C.motif.chemokine.11,fun=exp,ref.zero = TRUE)
+HR_FGF5<-Predict(cox_model, FGF5.Fibroblast.growth.factor.5,fun=exp,ref.zero = TRUE)
+
+ggplot() +
+  geom_line(data = HR_CXCL11, aes(CXCL11.C.X.C.motif.chemokine.11, yhat),
+            linetype = "solid", linewidth = 1, alpha = 0.7, colour = "#0070b9") +
+  geom_ribbon(data = HR_CXCL11, 
+              aes(CXCL11.C.X.C.motif.chemokine.11, ymin = lower, ymax = upper),
+              alpha = 0.1, fill = "#0070b9") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = 0.0078, linewidth = 1, color = '#d40e8c') + 
+  labs(title = "CXCL11", 
+       x = "CXCL11", 
+       y = "HR (95% CI)") +
+  scale_colour_manual(values = c("#0070b9", "#d40e8c")) +
+  scale_fill_manual(values = c("#0070b9", "#d40e8c"))
+
+ggplot() +
+  geom_line(data = HR_FGF5, aes(FGF5.Fibroblast.growth.factor.5, yhat),
+            linetype = "solid", linewidth = 1, alpha = 0.7, colour = "#0070b9") +
+  geom_ribbon(data = HR_FGF5, 
+              aes(FGF5.Fibroblast.growth.factor.5, ymin = lower, ymax = upper),
+              alpha = 0.1, fill = "#0070b9") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = 0.0078, linewidth = 1, color = '#d40e8c') + 
+  labs(title = "FGF5", 
+       x = "FGF5", 
+       y = "HR (95% CI)") +
+  scale_colour_manual(values = c("#0070b9", "#d40e8c")) +
+  scale_fill_manual(values = c("#0070b9", "#d40e8c"))
+```
+
+
+
+```{r KM曲线}
+# 安装并加载必要的包
+# install.packages("survminer")
+# install.packages("survival")
+library(survminer)
+library(survival)
+library(ggplot2)
+
+# 读取数据
+用于建模数据 <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data <- 用于建模数据
+str(data)
+
+# 转换AF变量
+data$AF <- as.numeric(as.factor(data$AF)) - 1
+
+# 将FGF5表达水平分成高低表达组
+median_FGF5 <- median(data$FGF5.Fibroblast.growth.factor.5, na.rm = TRUE)
+data$FGF5_group <- ifelse(data$FGF5.Fibroblast.growth.factor.5 > median_FGF5, "High", "Low")
+
+# 拟合Kaplan-Meier曲线
+km_fit <- survfit(Surv(Follow_up_duration_years, AF) ~ FGF5_group, data = data)
+
+
+# 自定义主题，设置全局字体为 Arial
+custom_theme <- theme_bw() + 
+  theme(
+    text = element_text(family = "Arial", color = "black", face = "bold"),  # 设置全局字体
+    axis.title = element_text(family = "Arial", color = "black", face = "bold"),  # 坐标轴标题
+    axis.text = element_text(family = "Arial", color = "black", face = "bold"),  # 坐标轴文本
+    legend.text = element_text(family = "Arial", color = "black", face = "bold"),  # 图例文本
+    legend.title = element_text(family = "Arial", color = "black", face = "bold"),  # 图例标题
+    plot.title = element_text(family = "Arial", color = "black", face = "bold", hjust = 0.5),  # 图表标题
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+
+cairo_pdf(file = "~/房颤与炎症性疾病/图片/Kaplan_Meier_FGF5.pdf", width = 10, height = 8)
+# 绘制Kaplan-Meier曲线并应用自定义主题
+ggsurvplot(km_fit, data = data,
+           palette = c("#d40e8c", "#0070b9"),  # 更改线的颜色
+           legend.labs = c("High", "Low"), # 标签
+           legend.title = "FGF5 level",
+           title = "Kaplan-Meier Curve for AF-Free Survival",
+           ylab = "Cumulative Probability of AF-Free Survival",
+           xlab = "Time (Years)", # 更改横纵坐标
+           censor.shape = 124, censor.size = 0.5, 
+           conf.int = TRUE, # 添加可信区间
+           break.x.by = 2,
+           risk.table = TRUE, tables.height = 0.2,
+           tables.theme = theme_cleantable(),
+           ggtheme = custom_theme, # 应用自定义主题
+           pval = TRUE, # 添加P值
+           pval.coord = c(0, 0.9), # 调节P值的位置
+           ylim = c(0.85, 1)) # 缩放y轴
+
+dev.off()
+
+
+# 安装并加载必要的包
+# install.packages("survminer")
+# install.packages("survival")
+library(survminer)
+library(survival)
+library(ggplot2)
+
+# 读取数据
+用于建模数据 <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data <- 用于建模数据
+str(data)
+
+# 转换AF变量
+data$AF <- as.numeric(as.factor(data$AF)) - 1
+
+# 将CXCL11表达水平分成高低表达组
+median_CXCL11 <- median(data$CXCL11.C.X.C.motif.chemokine.11, na.rm = TRUE)
+data$CXCL11_group <- ifelse(data$CXCL11.C.X.C.motif.chemokine.11 > median_CXCL11, "High", "Low")
+
+# 拟合Kaplan-Meier曲线
+km_fit <- survfit(Surv(Follow_up_duration_years, AF) ~ CXCL11_group, data = data)
+
+
+# 自定义主题，设置全局字体为 Arial
+custom_theme <- theme_bw() + 
+  theme(
+    text = element_text(family = "Arial", color = "black", face = "bold"),  # 设置全局字体
+    axis.title = element_text(family = "Arial", color = "black", face = "bold"),  # 坐标轴标题
+    axis.text = element_text(family = "Arial", color = "black", face = "bold"),  # 坐标轴文本
+    legend.text = element_text(family = "Arial", color = "black", face = "bold"),  # 图例文本
+    legend.title = element_text(family = "Arial", color = "black", face = "bold"),  # 图例标题
+    plot.title = element_text(family = "Arial", color = "black", face = "bold", hjust = 0.5),  # 图表标题
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  ) 
+
+
+# 绘制生存曲线并保存为PDF
+cairo_pdf(file = "~/房颤与炎症性疾病/图片/Kaplan_Meier_CXCL11.pdf", width = 10, height = 8)
+ggsurvplot(km_fit, data = data,
+           palette = c("#d40e8c", "#0070b9"),  # 更改线的颜色
+           legend.labs = c("High", "Low"), # 标签
+           legend.title = "CXCL11 level",
+           title = "Kaplan-Meier Curve for AF-Free Survival",
+           ylab = "Cumulative Probability of AF-Free Survival",
+           xlab = "Time (Years)", # 更改横纵坐标
+           censor.shape = 124, censor.size = 0.5, 
+           conf.int = TRUE, # 添加可信区间
+           break.x.by = 2,
+           risk.table = TRUE, tables.height = 0.2,
+           tables.theme = theme_cleantable(),
+           ggtheme = custom_theme, # 应用自定义主题
+           pval = TRUE, # 添加P值
+           pval.coord = c(0, 0.9), # 调节P值的位置
+           ylim = c(0.85, 1)) # 缩放y轴
+dev.off()
+
+
+```
+
+
+```{r 计算所有模型C指数的差异}
+# 加载必要的包
+library(tidyverse)
+library(survival)
+library(survminer)
+library(CoxBoost)
+library(dplyr)
+library(timeROC)
+library(survAUC)
+library(boot)
+library(randomForestSRC)
+library(plsRcox)
+library(mixOmics)
+library(superpc)
+library(gbm)
+library(pROC)
+
+data <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data$AF <- as.numeric(as.factor(data$AF)) - 1
+data$`Date of attending assessment centre | Instance 0` <- as.Date(data$`Date of attending assessment centre | Instance 0`)
+date_numeric <- as.numeric(data$`Date of attending assessment centre | Instance 0`)
+split_date_numeric <- quantile(date_numeric, 0.8, na.rm = TRUE)
+split_date <- as.Date(split_date_numeric, origin = "1970-01-01")
+
+# 划分训练集和验证集
+train_set <- subset(data, `Date of attending assessment centre | Instance 0` <= split_date)
+val_set <- subset(data, `Date of attending assessment centre | Instance 0` > split_date)
+
+# 变量列表
+all_vars <- c("Age.at.recruitment", "Gender_Male1_Female0", "CXCL11.C.X.C.motif.chemokine.11", 
+              "FGF5.Fibroblast.growth.factor.5", "Ethnic_white", "Education_level_numeric", 
+              "Socioeconomic_deprivation", "Current_smoking", "Alcohol_status", "Severe_pollution", 
+              "physical_inactivity", "No_coffee_intake", "Loneliness", "Broad_depression", 
+              "hypertension", "Low_LDL_C", "Low_Triglycerides", "Diabetes", "Overweight", 
+              "Elevated_CRP", "Clinical_comorbidities")
+
+train_set <- train_set[, c("Follow_up_duration", "AF", all_vars)]
+val_set <- val_set[, c("Follow_up_duration", "AF", all_vars)]
+
+# 将非数值类型的列转换为数值类型
+convert_to_numeric <- function(dataset) {
+  non_numeric_columns <- sapply(dataset, function(x) !is.numeric(x))
+  non_numeric_columns_names <- names(dataset)[non_numeric_columns]
+  dataset[non_numeric_columns_names] <- lapply(dataset[non_numeric_columns_names], function(x) as.numeric(as.factor(x)) - 1)
+  return(dataset)
+}
+
+train_set <- convert_to_numeric(train_set)
+val_set <- convert_to_numeric(val_set)
+
+# 读取模型预测结果
+val_set_with_Enet <- readRDS("~/房颤与炎症性疾病/Data/Enet模型存储数据/val_set_with_RS.RDS")
+val_set_with_CoxBoost <- readRDS("~/房颤与炎症性疾病/Data/CoxBoost模型存储数据/val_set_with_RS.RDS")
+val_set_with_all_RS <- readRDS("~/房颤与炎症性疾病/Data/模型比较/val_set_with_all_RS.RDS")
+val_set_with_RSF <- readRDS("~/房颤与炎症性疾病/Data/RSF模型存储数据/val_set_with_RS.RDS")
+val_set_with_plsRcox <- readRDS("~/房颤与炎症性疾病/Data/plsRcox模型存储数据/val_set_with_RS.RDS")
+val_set_with_SuperPC <- readRDS("~/房颤与炎症性疾病/Data/SuperPC模型存储数据/val_set_with_RS.RDS")
+val_set_with_GBM <- readRDS("~/房颤与炎症性疾病/Data/GBM模型存储数据/val_set_with_RS.RDS")
+
+# 添加新的模型时只需在此处增加新模型的名称和数据
+models <- list(
+  "Model1" = val_set_with_all_RS$RS_Model1,
+  "Model2" = val_set_with_all_RS$RS_Model2,
+  "Model3" = val_set_with_all_RS$RS_Model3,
+  "Enet" = val_set_with_Enet$RS,
+  "CoxBoost" = val_set_with_CoxBoost$RS_CoxBoost,
+  "RSF"=val_set_with_RSF$RS_RSF,
+  "plsRcox"=val_set_with_plsRcox$RS_plsRcox,
+  "SuperPC"=val_set_with_SuperPC$RS_SuperPC,
+  "GBM"=val_set_with_GBM$RS_GBM
+)
+
+# 提取需要的列
+time <- val_set$Follow_up_duration
+status <- val_set$AF
+
+# 定义计算C指数及其置信区间的函数
+calculate_cindex <- function(time, status, RS) {
+  data <- data.frame(Follow_up_duration = time, AF = status, RS = RS)
+  cox_model <- coxph(Surv(Follow_up_duration, AF) ~ RS, data = data)
+  cindex <- summary(cox_model)$concordance[1]
+  se <- summary(cox_model)$concordance[2]
+  ci_lower <- cindex - 1.96 * se
+  ci_upper <- cindex + 1.96 * se
+  return(c(C_index = cindex, CI_Lower = ci_lower, CI_Upper = ci_upper))
+}
+
+# 使用compareC包比较模型的C指数，仅返回P值
+compare_models <- function(time, status, RS1, RS2) {
+  compare_result <- compareC(time, status, RS1, RS2)
+  return(compare_result$pval)
+}
+
+# 初始化结果列表
+cindex_results <- list()
+pval_results <- list()
+
+# 计算每个模型的C指数及其置信区间
+for (model_name in names(models)) {
+  cindex_results[[model_name]] <- calculate_cindex(time, status, models[[model_name]])
+}
+
+# 进行模型两两比较并获取P值
+model_names <- names(models)
+for (i in 1:(length(model_names) - 1)) {
+  for (j in (i + 1):length(model_names)) {
+    model1 <- model_names[i]
+    model2 <- model_names[j]
+    pval_results[[paste(model1, "vs", model2, sep = "_")]] <- compare_models(time, status, models[[model1]], models[[model2]])
+  }
+}
+
+# 计算比较的总数
+total_comparisons <- length(pval_results)
+
+# 创建最终的数据框
+final_results <- data.frame(
+  Model_Comparison = character(),
+  Model1_C_index = numeric(),
+  Model1_CI_Lower = numeric(),
+  Model1_CI_Upper = numeric(),
+  Model2_C_index = numeric(),
+  Model2_CI_Lower = numeric(),
+  Model2_CI_Upper = numeric(),
+  P_Value = numeric(),
+  Bonferroni_Significant = logical(),
+  stringsAsFactors = FALSE
+)
+
+# 合并C指数和P值结果
+for (comparison in names(pval_results)) {
+  models <- strsplit(comparison, "_vs_")[[1]]
+  model1 <- models[1]
+  model2 <- models[2]
+  
+  p_value <- pval_results[[comparison]]
+  bonferroni_significant <- p_value * total_comparisons < 0.05
+  
+  final_results <- rbind(final_results, data.frame(
+    Model_Comparison = comparison,
+    Model1_C_index = cindex_results[[model1]][1],
+    Model1_CI_Lower = cindex_results[[model1]][2],
+    Model1_CI_Upper = cindex_results[[model1]][3],
+    Model2_C_index = cindex_results[[model2]][1],
+    Model2_CI_Lower = cindex_results[[model2]][2],
+    Model2_CI_Upper = cindex_results[[model2]][3],
+    P_Value = p_value,
+    Bonferroni_Significant = bonferroni_significant
+  ))
+}
+
+# 输出比较结果
+print(final_results)
+
+saveRDS(final_results, file = "~/房颤与炎症性疾病/Data/模型比较/cindex_and_pvalues_results.RDS")
+# 保存比较结果到CSV文件
+write.csv(final_results, "~/房颤与炎症性疾病/Data/模型比较/cindex_and_pvalues_results.csv", row.names = FALSE)
+```
+
+
+```{r 计算所有模型AUC的差异}
+# 加载必要的包
+library(tidyverse)
+library(survival)
+library(survminer)
+library(CoxBoost)
+library(dplyr)
+library(timeROC)
+library(survAUC)
+library(boot)
+library(randomForestSRC)
+library(plsRcox)
+library(mixOmics)
+library(superpc)
+library(gbm)
+library(pROC)
+
+# 读取和处理数据
+data <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data$AF <- as.numeric(as.factor(data$AF)) - 1
+data$`Date of attending assessment centre | Instance 0` <- as.Date(data$`Date of attending assessment centre | Instance 0`)
+date_numeric <- as.numeric(data$`Date of attending assessment centre | Instance 0`)
+split_date_numeric <- quantile(date_numeric, 0.8, na.rm = TRUE)
+split_date <- as.Date(split_date_numeric, origin = "1970-01-01")
+
+train_set <- subset(data, `Date of attending assessment centre | Instance 0` <= split_date)
+val_set <- subset(data, `Date of attending assessment centre | Instance 0` > split_date)
+
+# 变量列表
+all_vars <- c("Age.at.recruitment", "Gender_Male1_Female0", "CXCL11.C.X.C.motif.chemokine.11", 
+              "FGF5.Fibroblast.growth.factor.5", "Ethnic_white", "Education_level_numeric", 
+              "Socioeconomic_deprivation", "Current_smoking", "Alcohol_status", "Severe_pollution", 
+              "physical_inactivity", "No_coffee_intake", "Loneliness", "Broad_depression", 
+              "hypertension", "Low_LDL_C", "Low_Triglycerides", "Diabetes", "Overweight", 
+              "Elevated_CRP", "Clinical_comorbidities")
+
+# 模型1：仅包含四个特定变量
+selected_vars1 <- c("Age.at.recruitment", "Gender_Male1_Female0", "CXCL11.C.X.C.motif.chemokine.11", "FGF5.Fibroblast.growth.factor.5")
+formula_model1 <- as.formula(paste("Surv(Follow_up_duration, AF) ~", paste(selected_vars1, collapse = " + ")))
+cox_model1 <- coxph(formula_model1, data = train_set)
+val_set$RS_Model1 <- predict(cox_model1, newdata = val_set, type = "lp")
+
+# 模型2：纳入除蛋白外的所有变量
+selected_vars2 <- all_vars[!all_vars %in% c("CXCL11.C.X.C.motif.chemokine.11", "FGF5.Fibroblast.growth.factor.5")]
+formula_model2 <- as.formula(paste("Surv(Follow_up_duration, AF) ~", paste(selected_vars2, collapse = " + ")))
+cox_model2 <- coxph(formula_model2, data = train_set)
+val_set$RS_Model2 <- predict(cox_model2, newdata = val_set, type = "lp")
+
+# 模型3：纳入所有变量
+formula_model3 <- as.formula(paste("Surv(Follow_up_duration, AF) ~", paste(all_vars, collapse = " + ")))
+cox_model3 <- coxph(formula_model3, data = train_set)
+val_set$RS_Model3 <- predict(cox_model3, newdata = val_set, type = "lp")
+
+# 读取包含其他模型的验证集数据
+val_set_with_Enet <- readRDS("~/房颤与炎症性疾病/Data/Enet模型存储数据/val_set_with_RS.RDS")
+val_set_with_CoxBoost <- readRDS("~/房颤与炎症性疾病/Data/CoxBoost模型存储数据/val_set_with_RS.RDS")
+val_set_with_RSF <- readRDS("~/房颤与炎症性疾病/Data/RSF模型存储数据/val_set_with_RS.RDS")
+val_set_with_plsRcox <- readRDS("~/房颤与炎症性疾病/Data/plsRcox模型存储数据/val_set_with_RS.RDS")
+val_set_with_SuperPC <- readRDS("~/房颤与炎症性疾病/Data/SuperPC模型存储数据/val_set_with_RS.RDS")
+val_set_with_GBM <- readRDS("~/房颤与炎症性疾病/Data/GBM模型存储数据/val_set_with_RS.RDS")
+
+# 将所有模型的RS添加到val_set_with_all_RS
+val_set_with_all_RS <- val_set
+val_set_with_all_RS$RS_Enet <- val_set_with_Enet$RS
+val_set_with_all_RS$RS_CoxBoost <- val_set_with_CoxBoost$RS_CoxBoost
+val_set_with_all_RS$RS_RSF <- val_set_with_RSF$RS_RSF
+val_set_with_all_RS$RS_plsRcox <- val_set_with_plsRcox$RS_plsRcox
+val_set_with_all_RS$RS_SuperPC <- val_set_with_SuperPC$RS_SuperPC
+val_set_with_all_RS$RS_GBM <- val_set_with_GBM$RS_GBM
+
+# 保存包含所有风险评分的数据
+saveRDS(val_set_with_all_RS, file = "~/房颤与炎症性疾病/Data/模型比较/val_set_with_all_RS.RDS")
+
+# 读取包含风险评分的验证集数据
+val_set_with_RS <- readRDS("~/房颤与炎症性疾病/Data/模型比较/val_set_with_all_RS.RDS")
+
+# 指定时间点（以天为单位）
+time_points <- c(365, 5*365, 10*365, 15*365)
+
+# 模型列表
+model_names <- c("RS_Model1", "RS_Model2", "RS_Model3", "RS_Enet", "RS_CoxBoost", "RS_RSF", "RS_plsRcox", "RS_SuperPC", "RS_GBM")
+
+# 结果存储数据框
+comparison_results <- data.frame()
+
+# 两两比较
+for (i in 1:(length(model_names) - 1)) {
+  for (j in (i + 1):length(model_names)) {
+    model1 <- model_names[i]
+    model2 <- model_names[j]
+    
+    roc_model1 <- timeROC(T = val_set_with_RS$Follow_up_duration, 
+                          delta = val_set_with_RS$AF, 
+                          marker = val_set_with_RS[[model1]], 
+                          cause = 1, times = time_points, iid = TRUE)
+    
+    roc_model2 <- timeROC(T = val_set_with_RS$Follow_up_duration, 
+                          delta = val_set_with_RS$AF, 
+                          marker = val_set_with_RS[[model2]], 
+                          cause = 1, times = time_points, iid = TRUE)
+    
+    AUC_test_result <- timeROC::compare(roc_model1, roc_model2)
+    
+    for (k in 1:length(time_points)) {
+      time_point <- time_points[k]
+      p_value <- AUC_test_result$p_values_AUC[k]
+      model1_auc <- roc_model1$AUC[k]
+      model2_auc <- roc_model2$AUC[k]
+      
+      # 检查 p_value 是否为 NA，如果是则跳过
+      if (!is.na(p_value)) {
+        bonferroni_correction <- p_value * (length(model_names) * (length(model_names) - 1) / 2)
+        significant <- bonferroni_correction < 0.05
+        
+        comparison_results <- rbind(comparison_results, data.frame(
+          Time_Point = time_point,
+          Model_Comparison = paste(sub("RS_", "", model1), "vs", sub("RS_", "", model2)),
+          Model1_AUC = model1_auc,
+          Model2_AUC = model2_auc,
+          P_Value = p_value,
+          Significant_Bonferroni = significant
+        ))
+      }
+    }
+  }
+}
+
+# 打印比较结果
+print(comparison_results)
+
+# 保存比较结果
+saveRDS(comparison_results, file = "~/房颤与炎症性疾病/Data/模型比较/AUC_comparison_results.RDS")
+write.csv(comparison_results, file = "~/房颤与炎症性疾病/Data/模型比较/AUC_comparison_results.csv", row.names = FALSE)
+
+```
+
+
+```{r C指数作图}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# 加载数据
+data_frame <- readRDS("~/房颤与炎症性疾病/Data/模型比较/cindex_and_pvalues_results.RDS")
+
+# 指定模型比较顺序
+model_order <- c(
+  "Model1_vs_Model2", "Model1_vs_Model3", "Model1_vs_Enet", "Model1_vs_CoxBoost",
+  "Model1_vs_RSF", "Model1_vs_plsRcox", "Model1_vs_SuperPC", "Model1_vs_GBM",
+  "Model2_vs_Model3", "Model2_vs_Enet", "Model2_vs_CoxBoost", "Model2_vs_RSF",
+  "Model2_vs_plsRcox", "Model2_vs_SuperPC", "Model2_vs_GBM",
+  "Model3_vs_Enet", "Model3_vs_CoxBoost", "Model3_vs_RSF",
+  "Model3_vs_plsRcox", "Model3_vs_SuperPC", "Model3_vs_GBM",
+  "Enet_vs_CoxBoost", "Enet_vs_RSF", "Enet_vs_plsRcox", 
+  "Enet_vs_SuperPC", "Enet_vs_GBM", "CoxBoost_vs_RSF", "CoxBoost_vs_plsRcox", 
+  "CoxBoost_vs_SuperPC", "CoxBoost_vs_GBM", "RSF_vs_plsRcox", "RSF_vs_SuperPC", 
+  "RSF_vs_GBM", "plsRcox_vs_SuperPC", "plsRcox_vs_GBM", "SuperPC_vs_GBM"
+)
+
+# 按指定顺序排列 Model_Comparison
+data_frame$Model_Comparison <- factor(data_frame$Model_Comparison, levels = rev(model_order))
+
+# 转换数据框的格式以适应 ggplot2
+data_frame_long <- gather(data_frame, key = "C_Index_Type", value = "C_Index", Model1_C_index, Model2_C_index)
+
+# 创建热图
+ggplot(data_frame_long, aes(x = C_Index_Type, y = Model_Comparison, fill = C_Index)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "lightcoral") +
+  geom_text(aes(label = sprintf("C: %.5f", C_Index)), size = 3, family = "Arial", fontface = "bold", color = "black") +
+  geom_text(data = data_frame, aes(x = 2.8, y = Model_Comparison, label = sprintf("P: %.3e", P_Value)), size = 3, inherit.aes = FALSE, family = "Arial", fontface = "bold", color = "black") +
+  geom_text(data = data_frame, aes(x = 3.2, y = Model_Comparison, label = ifelse(Bonferroni_Significant, "T", "")), size = 3, inherit.aes = FALSE, family = "Arial", fontface = "bold", color = "black") +
+  labs(title = "Heatmap of C-Index Comparison between Models",
+       x = "C-Index Type",
+       y = "Model Comparison") +
+  theme_minimal(base_family = "Arial") +
+  theme(axis.text.y = element_text(size = 10, face = "bold", color = "black"),
+        axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1, face = "bold", color = "black"),
+        plot.margin = unit(c(1, 5, 1, 1), "lines"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank()) +
+  scale_x_discrete(expand = expansion(add = c(0.5, 2)))
+```
+
+
+```{r AUC作图}
+# 加载必要的包
+library(tidyverse)
+library(ggrepel)
+
+# 读取数据
+results <- readRDS("~/房颤与炎症性疾病/Data/模型比较/AUC_comparison_results.RDS")
+
+# 转换数据格式
+results_long <- results %>%
+  gather(key = "Model", value = "AUC", Model1_AUC, Model2_AUC) %>%
+  mutate(Model = ifelse(Model == "Model1_AUC", str_extract(Model_Comparison, "^[^ ]+"), str_extract(Model_Comparison, "[^ ]+$")))
+
+# 提取模型对比和AUC值
+results_long <- results_long %>%
+  distinct(Time_Point, Model, AUC)
+
+# 创建折线图
+ggplot(results_long, aes(x = as.factor(Time_Point), y = AUC, group = Model, color = Model)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_label_repel(aes(label = sprintf("%s: %.4f", Model, AUC)), size = 3, fontface = "bold", color = "black", box.padding = 0.5, point.padding = 0.5, max.overlaps = 100) +
+  scale_color_manual(values = c("Model1" = "blue", "Model2" = "green", "Model3" = "red", "Enet" = "purple", "CoxBoost" = "orange", "RSF" = "cyan", "plsRcox" = "pink", "SuperPC" = "brown", "GBM" = "darkgreen")) +
+  labs(title = "AUC Comparison Across Different Time Points",
+       x = "Time Points (Days)",
+       y = "AUC",
+       color = "Model") +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+```{r 发现和验证队列基线}
+data <- readRDS("~/房颤与炎症性疾病/Data/用于建模数据.RDS")
+data$AF <- as.numeric(as.factor(data$AF)) - 1
+data$`Date of attending assessment centre | Instance 0` <- as.Date(data$`Date of attending assessment centre | Instance 0`)
+date_numeric <- as.numeric(data$`Date of attending assessment centre | Instance 0`)
+split_date_numeric <- quantile(date_numeric, 0.8, na.rm = TRUE)
+split_date <- as.Date(split_date_numeric, origin = "1970-01-01")
+
+# 添加 group 列
+data$group <- ifelse(data$`Date of attending assessment centre | Instance 0` <= split_date, 0, 1)
+
+table(data$group)
+colnames(data)
+
+# 定义要排除的列名
+exclude_vars <- c("Participant_ID", "group", "CXCL11.C.X.C.motif.chemokine.11", 
+                  "FGF5.Fibroblast.growth.factor.5", "AF", "Date_of_consenting", 
+                  "Follow_up_duration", "Follow_up_duration_years", 
+                  "Participant ID", "Date of attending assessment centre | Instance 0", 
+                  "UK Biobank assessment centre | Instance 0","Clinical_comorbidities")
+
+# 选择不在排除列表中的列名
+myVars <- names(data)[!names(data) %in% exclude_vars]
+
+
+# 初始化一个空向量用于存储分类变量
+catVars <- c()
+
+# 遍历所有变量，并检查是否为分类变量
+for (var in myVars) {
+  if (is.factor(data[[var]])) {
+    catVars <- c(catVars, var)
+  }
+}
+
+# 初始化一个空向量用于存储不服从正态分布的变量
+nonvar <- c()
+
+library(nortest)
+# 遍历所有变量，并进行正态性检验
+for (var in myVars) {
+  if (is.numeric(data[[var]])) {
+    ad_result <- ad.test(data[[var]])
+    if (ad_result$p.value <= 0.05) {
+      nonvar <- c(nonvar, var)
+    }
+  }
+}
+print(nonvar)
+
+# 初始化一个空向量用于存储需要使用 Fisher 精确检验的变量
+exactvars <- c()
+
+# 遍历所有变量，并进行 Fisher 精确检验或卡方检验判断
+for (var in myVars) {
+  if (is.factor(data[[var]])) {
+    table <- table(data[[var]])
+    n <- sum(table)
+    
+    # 检查是否满足条件1
+    if (n >= 40 && sum(table < 5) >= 2 && any(table < 5)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+    # 检查是否满足条件2
+    if (n < 40 || any(table < 1)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+  }
+}
+
+table <- CreateTableOne(vars = myVars, #条件1
+                        factorVars = catVars,#条件2
+                        strata = "group", #条件4
+                        data = data, #原始数据
+                        addOverall = TRUE) #条件6加入overall
+
+
+table1<- print(table, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table1, file = "~/房颤与炎症性疾病/Data/文章表格/发现和验证队列基线.csv")
+```
+
+
+
+
+
